@@ -432,7 +432,7 @@ async function notifyNewOrder(order) {
     } else if (twilioConfigured()) {
       await broadcastSms(recipients, body);
     }
-  } catch (e) { console.error('notifyNewOrder failed:', e.message || e); }
+  } catch (e) { console.error('notifyNewOrder failed:', e && e.stack ? e.stack : e); }
 }
 
 // ---------------------------------------------------------------------------
@@ -651,7 +651,8 @@ on('POST', '/api/sms-recipients/:id/test', async (req, res, params) => {
     }
     sendJson(res, 200, { ok: true });
   } catch (e) {
-    sendJson(res, 502, { error: e.message || 'Test message failed to send.' });
+    console.error('SMS test send failed:', e && e.stack ? e.stack : e);
+    sendJson(res, 502, { error: (e && e.message) || 'Test message failed to send.' });
   }
 });
 on('DELETE', '/api/sms-recipients/:id', async (req, res, params) => {
