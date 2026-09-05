@@ -455,15 +455,23 @@ async function broadcastClickSendSms(recipients, body) {
 }
 
 function formatOrderSms(order) {
+  const materialTotal = Number(order.quantity || 0) * Number(order.price_per_unit || 0);
+  const total = materialTotal + Number(order.delivery_fee || 0);
+  const orderDate = (order.created_at || '').slice(0, 10) || todayStr();
   const lines = [
-    `New Order ${order.order_number}`,
-    `${order.quantity} ${order.unit} ${order.material_name} for ${order.customer_name}`,
-    `Deliver to: ${order.delivery_address}`,
+    `NEW ORDER - ${order.order_number}`,
+    `- Date: ${orderDate}`,
+    `- Name: ${order.customer_name}`,
+    `- Address: ${order.delivery_address}`,
+    `- Material: ${order.material_name}`,
+    `- Amount: ${order.quantity} ${order.unit}`,
+    `- Total: $${total.toFixed(2)}`,
   ];
-  if (order.requested_date) lines.push(`Requested: ${order.requested_date}${order.requested_window ? ' ' + order.requested_window : ''}`);
-  if (order.driver_name) lines.push(`Driver: ${order.driver_name}${order.scheduled_date ? ' on ' + order.scheduled_date : ''}`);
-  if (order.delivery_fee) lines.push(`Delivery fee: $${order.delivery_fee}${order.distance_miles ? ` (${order.distance_miles} mi)` : ''}`);
-  if (order.notes) lines.push(`Notes: ${order.notes}`);
+  if (order.customer_phone) lines.push(`- Phone: ${order.customer_phone}`);
+  if (order.requested_date) lines.push(`- Requested: ${order.requested_date}${order.requested_window ? ' ' + order.requested_window : ''}`);
+  if (order.driver_name) lines.push(`- Driver: ${order.driver_name}${order.scheduled_date ? ' on ' + order.scheduled_date : ''}`);
+  if (order.delivery_fee) lines.push(`- Delivery fee: $${Number(order.delivery_fee).toFixed(2)}${order.distance_miles ? ` (${order.distance_miles} mi)` : ''}`);
+  if (order.notes) lines.push(`- Notes: ${order.notes}`);
   return lines.join('\n');
 }
 async function notifyNewOrder(order) {
