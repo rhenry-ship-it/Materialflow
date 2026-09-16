@@ -208,7 +208,39 @@ function backfillJobStatusFromBoard() {
   backfillDeliveryAmounts();
   backfillDeliveryPayments();
   backfillJobStatusFromBoard();
+  extendMileageBandsPast20Miles();
 })();
+
+// One-time: the office's original mileage bands topped out at 15–20mi
+// ($150), then a flat "20+ miles — call for quote" band with no fee —
+// meaning Quote/New Order could never offer a number for anything past 20
+// miles, only a manual callback. The office asked to keep going with the
+// same +$25-per-5-miles pattern their existing bands already follow, out to
+// 50 miles, with the manual-quote catch-all pushed out to start there
+// instead. Guarded by a settings flag (not "is there already a 20-25mi
+// band", since re-adding a band the office later deleted on purpose would
+// be just as wrong as skipping this once); only touches the specific
+// default 20+/no-fee row it's looking for, so a catch-all the office has
+// already customized by the time this runs is left alone.
+function extendMileageBandsPast20Miles() {
+  if (db.prepare(`SELECT value FROM settings WHERE key = 'mileage_bands_extended_v1'`).get()) return;
+  const oldCatchAll = db.prepare(
+    `SELECT * FROM mileage_bands WHERE min_miles = 20 AND max_miles IS NULL AND fee IS NULL`
+  ).get();
+  if (oldCatchAll) {
+    db.prepare(`UPDATE mileage_bands SET min_miles = 50, label = '50+ miles — call for quote', sort_order = 10 WHERE id = ?`)
+      .run(oldCatchAll.id);
+    const newBands = [
+      [20, 25, 175, '20–25 miles', 4], [25, 30, 200, '25–30 miles', 5], [30, 35, 225, '30–35 miles', 6],
+      [35, 40, 250, '35–40 miles', 7], [40, 45, 275, '40–45 miles', 8], [45, 50, 300, '45–50 miles', 9],
+    ];
+    for (const [minMiles, maxMiles, fee, label, sortOrder] of newBands) {
+      db.prepare(`INSERT INTO mileage_bands (min_miles, max_miles, fee, label, sort_order) VALUES (?, ?, ?, ?, ?)`)
+        .run(minMiles, maxMiles, fee, label, sortOrder);
+    }
+  }
+  db.prepare(`INSERT INTO settings (key, value) VALUES ('mileage_bands_extended_v1', '1')`).run();
+}
 
 // Orders created before the `deliveries` table existed have no rows there.
 // The schedule board and driver app both read from `deliveries`, so give
@@ -336,9 +368,15 @@ function setSetting(key, value) {
   setSetting('shop_lat', '');
   setSetting('shop_lng', '');
 
+  // $25 more every 5 miles out to 50, then a manual-quote catch-all beyond
+  // that — matches the office's own pricing pattern (see
+  // extendMileageBandsPast20Miles, the migration that carries this same
+  // progression into an existing production database).
   const bands = [
     [0, 5, 75, '0–5 miles'], [5, 10, 100, '5–10 miles'], [10, 15, 125, '10–15 miles'],
-    [15, 20, 150, '15–20 miles'], [20, null, null, '20+ miles — call for quote'],
+    [15, 20, 150, '15–20 miles'], [20, 25, 175, '20–25 miles'], [25, 30, 200, '25–30 miles'],
+    [30, 35, 225, '30–35 miles'], [35, 40, 250, '35–40 miles'], [40, 45, 275, '40–45 miles'],
+    [45, 50, 300, '45–50 miles'], [50, null, null, '50+ miles — call for quote'],
   ];
   bands.forEach(([min_miles, max_miles, fee, label], i) => run('INSERT INTO mileage_bands (min_miles, max_miles, fee, label, sort_order) VALUES (?, ?, ?, ?, ?)', [min_miles, max_miles, fee, label, i]));
 
