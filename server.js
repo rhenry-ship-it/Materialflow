@@ -1,6 +1,8 @@
 // ===========================================================================
 // OPD Development Corp — single-file build (for easy GitHub web-upload + Railway deploy)
-// Zero npm dependencies: uses only Node's built-ins (http, node:sqlite, crypto, fetch).
+// Zero npm dependencies: uses only Node's built-ins (http, node:sqlite, crypto,
+// fetch, zlib — the last one is what lets the bulk-import endpoints read an
+// .xlsx file's zip container without pulling in a library for it).
 // This file is generated from the multi-file source project — see the README
 // in the original delivered zip if you want to work from the split-out version.
 // ===========================================================================
@@ -8,6 +10,7 @@
 const http = require('http');
 const crypto = require('crypto');
 const tls = require('tls');
+const zlib = require('zlib');
 const { DatabaseSync } = require('node:sqlite');
 
 // ---------------------------------------------------------------------------
@@ -461,6 +464,187 @@ function parseMoneyLoose(str) {
   return isNaN(n) ? null : n;
 }
 
+// ---- .xlsx import helpers (zero-dependency) ----
+// An .xlsx file is just a zip archive of XML files. Rather than pull in a
+// library for it, this reads the zip's central directory by hand (well-
+// documented, fixed-layout binary format), inflates each entry with Node's
+// built-in zlib (the only compression method real spreadsheet exports use),
+// and picks apart the small slice of the OOXML spec — workbook.xml (which
+// sheet is first), sharedStrings.xml (Excel dedupes repeated text into a
+// shared table instead of writing it inline) and the sheet's own XML — that
+// a plain data export actually uses. It deliberately does not handle
+// multi-sheet selection, cell styles/formatting, formulas, or merged cells;
+// this is for reading a single flat table off the first tab, which is what
+// every "download this sheet" export from Excel or Google Sheets produces.
+function zipCentralDirectoryEntries(buf) {
+  const EOCD_SIG = 0x06054b50;
+  let eocdOffset = -1;
+  const searchFloor = Math.max(0, buf.length - 66000); // EOCD (22B) + max 64KB comment
+  for (let i = buf.length - 22; i >= searchFloor; i--) {
+    if (buf.readUInt32LE(i) === EOCD_SIG) { eocdOffset = i; break; }
+  }
+  if (eocdOffset === -1) throw new Error('That file is not a valid .xlsx');
+  const cdEntryCount = buf.readUInt16LE(eocdOffset + 10);
+  const cdOffset = buf.readUInt32LE(eocdOffset + 16);
+
+  const entries = [];
+  const CD_SIG = 0x02014b50;
+  let p = cdOffset;
+  for (let i = 0; i < cdEntryCount; i++) {
+    if (buf.readUInt32LE(p) !== CD_SIG) break;
+    const compressionMethod = buf.readUInt16LE(p + 10);
+    const compressedSize = buf.readUInt32LE(p + 20);
+    const nameLen = buf.readUInt16LE(p + 28);
+    const extraLen = buf.readUInt16LE(p + 30);
+    const commentLen = buf.readUInt16LE(p + 32);
+    const localHeaderOffset = buf.readUInt32LE(p + 42);
+    const name = buf.toString('utf8', p + 46, p + 46 + nameLen);
+    entries.push({ name, compressionMethod, compressedSize, localHeaderOffset });
+    p += 46 + nameLen + extraLen + commentLen;
+  }
+  return entries;
+}
+function zipExtractEntry(buf, entry) {
+  const LOCAL_SIG = 0x04034b50;
+  const p = entry.localHeaderOffset;
+  if (buf.readUInt32LE(p) !== LOCAL_SIG) throw new Error(`Corrupt .xlsx entry: ${entry.name}`);
+  const nameLen = buf.readUInt16LE(p + 26);
+  const extraLen = buf.readUInt16LE(p + 28);
+  const dataStart = p + 30 + nameLen + extraLen;
+  const compressed = buf.subarray(dataStart, dataStart + entry.compressedSize);
+  if (entry.compressionMethod === 0) return Buffer.from(compressed);
+  if (entry.compressionMethod === 8) return zlib.inflateRawSync(compressed);
+  throw new Error(`Unsupported .xlsx compression method: ${entry.compressionMethod}`);
+}
+function xmlUnescape(s) {
+  return String(s)
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&amp;/g, '&');
+}
+function parseSharedStrings(xml) {
+  if (!xml) return [];
+  const strings = [];
+  const siRe = /<si[^>]*>([\s\S]*?)<\/si>/g;
+  let m;
+  while ((m = siRe.exec(xml))) {
+    const parts = [];
+    const tRe = /<t[^>]*>([\s\S]*?)<\/t>/g;
+    let tm;
+    while ((tm = tRe.exec(m[1]))) parts.push(xmlUnescape(tm[1]));
+    strings.push(parts.join(''));
+  }
+  return strings;
+}
+function colLetterToIndex(letters) {
+  let n = 0;
+  for (let i = 0; i < letters.length; i++) n = n * 26 + (letters.charCodeAt(i) - 64);
+  return n - 1;
+}
+// Excel/Sheets store dates as a plain number of days since 1899-12-30 (that
+// epoch, not 1/1/1900, is what makes the format's well-known "1900 was a
+// leap year" bug line up correctly) — this is the standard conversion every
+// spreadsheet app uses to read/write that serial.
+function excelSerialToDateStr(serial) {
+  const n = Number(serial);
+  if (!isFinite(n)) return null;
+  const d = new Date(Math.round((n - 25569) * 86400 * 1000));
+  if (isNaN(d.getTime())) return null;
+  return `${d.getUTCMonth() + 1}/${d.getUTCDate()}/${d.getUTCFullYear()}`;
+}
+function parseSheetRows(xml, sharedStrings) {
+  const rows = [];
+  const rowRe = /<row\b[^>]*>([\s\S]*?)<\/row>/g;
+  let rm;
+  while ((rm = rowRe.exec(xml))) {
+    const cells = [];
+    const cellRe = /<c\b([^>]*?)\/>|<c\b([^>]*?)>([\s\S]*?)<\/c>/g;
+    let cm;
+    while ((cm = cellRe.exec(rm[1]))) {
+      const attrs = cm[2] !== undefined ? cm[2] : cm[1];
+      const inner = cm[3] || '';
+      const refMatch = attrs.match(/\br="([A-Z]+)\d+"/);
+      const colIdx = refMatch ? colLetterToIndex(refMatch[1]) : cells.length;
+      const typeMatch = attrs.match(/\bt="([^"]+)"/);
+      const type = typeMatch ? typeMatch[1] : null;
+      let value = '';
+      if (type === 'inlineStr') {
+        const tMatch = inner.match(/<t[^>]*>([\s\S]*?)<\/t>/);
+        value = tMatch ? xmlUnescape(tMatch[1]) : '';
+      } else {
+        const vMatch = inner.match(/<v[^>]*>([\s\S]*?)<\/v>/);
+        const raw = vMatch ? vMatch[1] : '';
+        if (type === 's') value = sharedStrings[parseInt(raw, 10)] || '';
+        else if (type === 'b') value = raw === '1' ? 'TRUE' : 'FALSE';
+        else if (type === 'str') value = xmlUnescape(raw);
+        else value = raw; // plain number, or a date serial — resolved once headers are known
+      }
+      cells[colIdx] = value;
+    }
+    rows.push(cells);
+  }
+  return rows;
+}
+// Converts an uploaded .xlsx file's first sheet into the same shape
+// csvToObjects() produces (array of objects keyed by a normalized header
+// name), so every existing import endpoint can accept either format without
+// its own row-mapping/validation logic changing at all.
+function parseXlsxToObjects(buf) {
+  const entries = zipCentralDirectoryEntries(buf);
+  const byName = {};
+  entries.forEach((e) => { byName[e.name] = e; });
+  const readXml = (name) => (byName[name] ? zipExtractEntry(buf, byName[name]).toString('utf8') : null);
+
+  const workbookXml = readXml('xl/workbook.xml');
+  const relsXml = readXml('xl/_rels/workbook.xml.rels');
+  if (!workbookXml) throw new Error('That .xlsx file looks corrupted (no workbook found)');
+
+  // The first <sheet> element in workbook.xml is the first tab, regardless
+  // of what its underlying sheetN.xml file happens to be named.
+  let sheetPath = 'xl/worksheets/sheet1.xml';
+  const firstSheetTag = workbookXml.match(/<sheet\b[^>]*\/?>/);
+  const rIdMatch = firstSheetTag && firstSheetTag[0].match(/r:id="([^"]+)"/);
+  if (rIdMatch && relsXml) {
+    const relRe = new RegExp(`<Relationship\\b[^>]*\\bId="${rIdMatch[1]}"[^>]*\\bTarget="([^"]+)"`);
+    const relMatch = relsXml.match(relRe);
+    if (relMatch) sheetPath = relMatch[1].replace(/^\.?\//, '').startsWith('xl/') ? relMatch[1].replace(/^\.?\//, '') : `xl/${relMatch[1].replace(/^\.?\//, '')}`;
+  }
+
+  const sharedStrings = parseSharedStrings(readXml('xl/sharedStrings.xml'));
+  const sheetXml = readXml(sheetPath) || readXml('xl/worksheets/sheet1.xml');
+  if (!sheetXml) throw new Error('Could not find a worksheet inside that .xlsx file');
+
+  const rows = parseSheetRows(sheetXml, sharedStrings);
+  if (!rows.length) return [];
+  const headers = rows[0].map((h) => String(h || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, ''));
+  return rows.slice(1).map((r) => {
+    const obj = {};
+    headers.forEach((h, idx) => {
+      if (!h) return;
+      let v = r[idx] !== undefined ? String(r[idx]) : '';
+      // A purely-numeric value under a header mentioning "date" is almost
+      // certainly an Excel date serial (spreadsheets store dates as numbers,
+      // never as text) — convert it to the same M/D/YYYY shape a CSV export
+      // would already be in, so parseFlexibleDate() handles either the same way.
+      if (v && /date/.test(h) && /^\d+(\.\d+)?$/.test(v)) {
+        const converted = excelSerialToDateStr(v);
+        if (converted) v = converted;
+      }
+      obj[h] = v.trim();
+    });
+    return obj;
+  });
+}
+// Shared by every bulk-import endpoint: accepts either `{ csv }` (raw CSV
+// text, from a .csv upload) or `{ xlsx_base64 }` (a base64-encoded .xlsx
+// upload — see readFileForImport() in app.js) and returns the same array of
+// row objects either way.
+function rowsFromImportBody(b) {
+  if (b && b.xlsx_base64) return parseXlsxToObjects(Buffer.from(b.xlsx_base64, 'base64'));
+  return csvToObjects((b && b.csv) || '');
+}
+
 function sendJson(res, status, data) {
   const body = JSON.stringify(data);
   res.writeHead(status, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), 'Cache-Control': 'no-store' });
@@ -824,6 +1008,44 @@ function wrapPdfText(str, maxChars) {
   if (line) lines.push(line);
   return lines;
 }
+
+// ---- Real glyph widths for the two base-14 fonts every report PDF uses
+// (Helvetica as F1, Helvetica-Bold as F2) — standard AFM metrics, in
+// 1/1000-em units. Every report table below used to truncate a cell's text
+// by a guessed character count (`.slice(0, 12)`), which is wrong for a
+// proportional font: a customer/material name full of wide characters
+// ("Millings", "Wakefield") could still overflow into the next column even
+// truncated, while a narrow one got cut shorter than it needed to be. These
+// tables let pdfTextWidth() measure a string's actual rendered width, so
+// truncatePdfText() below can fit text to a column's real width in points.
+const PDF_FONT_WIDTHS = {
+  F1: { 32: 278, 33: 278, 34: 355, 35: 556, 36: 556, 37: 889, 38: 667, 39: 191, 40: 333, 41: 333, 42: 389, 43: 584, 44: 278, 45: 333, 46: 278, 47: 278, 48: 556, 49: 556, 50: 556, 51: 556, 52: 556, 53: 556, 54: 556, 55: 556, 56: 556, 57: 556, 58: 278, 59: 278, 60: 584, 61: 584, 62: 584, 63: 556, 64: 1015, 65: 667, 66: 667, 67: 722, 68: 722, 69: 667, 70: 611, 71: 778, 72: 722, 73: 278, 74: 500, 75: 667, 76: 556, 77: 833, 78: 722, 79: 778, 80: 667, 81: 778, 82: 722, 83: 667, 84: 611, 85: 722, 86: 667, 87: 944, 88: 667, 89: 667, 90: 611, 91: 278, 92: 278, 93: 278, 94: 469, 95: 556, 96: 333, 97: 556, 98: 556, 99: 500, 100: 556, 101: 556, 102: 278, 103: 556, 104: 556, 105: 222, 106: 222, 107: 500, 108: 222, 109: 833, 110: 556, 111: 556, 112: 556, 113: 556, 114: 333, 115: 500, 116: 278, 117: 556, 118: 500, 119: 722, 120: 500, 121: 500, 122: 500, 123: 334, 124: 260, 125: 334, 126: 584 },
+  F2: { 32: 278, 33: 333, 34: 474, 35: 556, 36: 556, 37: 889, 38: 722, 39: 238, 40: 333, 41: 333, 42: 389, 43: 584, 44: 278, 45: 333, 46: 278, 47: 278, 48: 556, 49: 556, 50: 556, 51: 556, 52: 556, 53: 556, 54: 556, 55: 556, 56: 556, 57: 556, 58: 333, 59: 333, 60: 584, 61: 584, 62: 584, 63: 611, 64: 975, 65: 722, 66: 667, 67: 722, 68: 722, 69: 667, 70: 611, 71: 778, 72: 722, 73: 278, 74: 556, 75: 722, 76: 611, 77: 833, 78: 722, 79: 778, 80: 667, 81: 778, 82: 722, 83: 667, 84: 611, 85: 722, 86: 667, 87: 944, 88: 667, 89: 667, 90: 611, 91: 333, 92: 278, 93: 333, 94: 584, 95: 556, 96: 333, 97: 556, 98: 611, 99: 556, 100: 611, 101: 556, 102: 333, 103: 611, 104: 611, 105: 278, 106: 278, 107: 556, 108: 278, 109: 889, 110: 611, 111: 611, 112: 611, 113: 611, 114: 389, 115: 556, 116: 333, 117: 611, 118: 556, 119: 778, 120: 556, 121: 556, 122: 500, 123: 389, 124: 280, 125: 389, 126: 584 },
+};
+function pdfTextWidth(str, font = 'F1', size = 10) {
+  const table = PDF_FONT_WIDTHS[font] || PDF_FONT_WIDTHS.F1;
+  const s = toAsciiSafe(str);
+  let units = 0;
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    units += table[code] !== undefined ? table[code] : 556; // 556 ≈ Helvetica's average glyph — used for anything outside plain ASCII (rare)
+  }
+  return (units / 1000) * size;
+}
+// Fits `str` into `maxWidth` points at the given font/size, appending "..."
+// only when it actually doesn't fit — using real glyph widths (above)
+// rather than a guessed character count, so a table cell never runs into
+// the column next to it. Returns the string unchanged when it already fits.
+function truncatePdfText(str, font, size, maxWidth) {
+  const s = toAsciiSafe(str || '');
+  if (pdfTextWidth(s, font, size) <= maxWidth) return s;
+  let lo = 0, hi = s.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (pdfTextWidth(s.slice(0, mid) + '...', font, size) <= maxWidth) lo = mid; else hi = mid - 1;
+  }
+  return lo <= 0 ? '...' : s.slice(0, lo) + '...';
+}
 function buildOrderInvoicePdf(order, customer, company = {}) {
   const companyName = company.name || 'OPD Development Corp';
   const doc = new PdfDoc();
@@ -860,7 +1082,7 @@ function buildOrderInvoicePdf(order, customer, company = {}) {
   const qty = Number(order.quantity || 0);
   const price = Number(order.price_per_unit || 0);
   const materialAmount = qty * price;
-  doc.text(50, y, `${order.material_name || 'Material'} — delivered to ${order.delivery_address || ''}`.slice(0, 70), { size: 10 });
+  doc.text(50, y, truncatePdfText(`${order.material_name || 'Material'} — delivered to ${order.delivery_address || ''}`, 'F1', 10, 242), { size: 10 });
   doc.text(300, y, `${qty} ${order.unit || ''}`, { size: 10 });
   doc.text(360, y, `$${price.toFixed(2)}`, { size: 10 });
   doc.text(460, y, `$${materialAmount.toFixed(2)}`, { size: 10 });
@@ -966,22 +1188,22 @@ function buildFinancialReportPdf(summary, orders, opts = {}) {
   y -= 8;
   doc.text(marginX, y, 'Revenue by Material', { font: 'F2', size: 12 }); y -= 16;
   (summary.revenueByMaterial || []).slice(0, 12).forEach((r) => {
-    doc.text(marginX, y, r.material_name, { size: 9 });
+    doc.text(marginX, y, truncatePdfText(r.material_name, 'F1', 9, 290), { size: 9 });
     doc.text(marginX + 300, y, `$${Number(r.revenue).toFixed(2)}`, { size: 9 });
     y -= 13;
   });
   y -= 8;
   doc.text(marginX, y, 'Top Customers', { font: 'F2', size: 12 }); y -= 16;
   (summary.topCustomers || []).slice(0, 12).forEach((r) => {
-    doc.text(marginX, y, r.customer_name, { size: 9 });
+    doc.text(marginX, y, truncatePdfText(r.customer_name, 'F1', 9, 290), { size: 9 });
     doc.text(marginX + 300, y, `$${Number(r.revenue).toFixed(2)}`, { size: 9 });
     y -= 13;
   });
   doc.newPage();
   y = header('Order Ledger');
   const cols = [
-    { label: 'Date', x: marginX }, { label: 'Order #', x: marginX + 58 }, { label: 'Customer', x: marginX + 152 },
-    { label: 'Material', x: marginX + 265 }, { label: 'Qty', x: marginX + 348 }, { label: 'Amount', x: marginX + 392 }, { label: 'Status', x: marginX + 450 },
+    { label: 'Date', x: marginX, w: 50 }, { label: 'Order #', x: marginX + 55, w: 88 }, { label: 'Customer', x: marginX + 148, w: 108 },
+    { label: 'Material', x: marginX + 261, w: 78 }, { label: 'Qty', x: marginX + 344, w: 42 }, { label: 'Amount', x: marginX + 391, w: 55 }, { label: 'Status', x: marginX + 451, w: 61 },
   ];
   function ledgerTableHeader() {
     cols.forEach((c) => doc.text(c.x, y, c.label, { font: 'F2', size: 9 }));
@@ -991,12 +1213,12 @@ function buildFinancialReportPdf(summary, orders, opts = {}) {
   (orders || []).forEach((o) => {
     if (y < pageBottom + 20) { doc.newPage(); y = header('Order Ledger (cont.)'); ledgerTableHeader(); }
     doc.text(cols[0].x, y, formatEasternDateShort(o.created_at), { size: 8 });
-    doc.text(cols[1].x, y, o.order_number || '', { size: 8 });
-    doc.text(cols[2].x, y, String(o.customer_name || '').slice(0, 20), { size: 8 });
-    doc.text(cols[3].x, y, String(o.material_name || '').slice(0, 16), { size: 8 });
-    doc.text(cols[4].x, y, `${o.quantity} ${o.unit || ''}`, { size: 8 });
-    doc.text(cols[5].x, y, `$${Number(o.total_amount || 0).toFixed(2)}`, { size: 8 });
-    doc.text(cols[6].x, y, o.status || '', { size: 8 });
+    doc.text(cols[1].x, y, truncatePdfText(o.order_number || '', 'F1', 8, cols[1].w - 4), { size: 8 });
+    doc.text(cols[2].x, y, truncatePdfText(o.customer_name || '', 'F1', 8, cols[2].w - 4), { size: 8 });
+    doc.text(cols[3].x, y, truncatePdfText(o.material_name || '', 'F1', 8, cols[3].w - 4), { size: 8 });
+    doc.text(cols[4].x, y, truncatePdfText(`${o.quantity} ${o.unit || ''}`, 'F1', 8, cols[4].w - 4), { size: 8 });
+    doc.text(cols[5].x, y, truncatePdfText(`$${Number(o.total_amount || 0).toFixed(2)}`, 'F1', 8, cols[5].w - 4), { size: 8 });
+    doc.text(cols[6].x, y, truncatePdfText(o.status || '', 'F1', 8, cols[6].w - 4), { size: 8 });
     y -= 12;
   });
   return doc.toBuffer();
@@ -1047,10 +1269,10 @@ function buildDriverShiftReportPdf(shift, driver, stats, company = {}) {
     y -= 13;
     stats.deliveries.forEach((d) => {
       if (y < 140) { doc.newPage(); y = PDF_PAGE_HEIGHT - 60; }
-      doc.text(marginX, y, d.order_number || '', { size: 8 });
-      doc.text(marginX + 90, y, String(d.customer_name || '').slice(0, 24), { size: 8 });
-      doc.text(marginX + 240, y, String(d.material_name || '').slice(0, 16), { size: 8 });
-      doc.text(marginX + 340, y, `${d.quantity} ${d.unit || ''}`, { size: 8 });
+      doc.text(marginX, y, truncatePdfText(d.order_number || '', 'F1', 8, 86), { size: 8 });
+      doc.text(marginX + 90, y, truncatePdfText(d.customer_name || '', 'F1', 8, 144), { size: 8 });
+      doc.text(marginX + 240, y, truncatePdfText(d.material_name || '', 'F1', 8, 94), { size: 8 });
+      doc.text(marginX + 340, y, truncatePdfText(`${d.quantity} ${d.unit || ''}`, 'F1', 8, 54), { size: 8 });
       doc.text(marginX + 400, y, d.amount != null ? `$${Number(d.amount).toFixed(2)}` : '—', { size: 8 });
       y -= 12;
     });
@@ -1128,14 +1350,14 @@ function buildOpenOrdersReportPdf(orders, company = {}) {
   y -= 18;
 
   const cols = [
-    { label: 'Order #', x: marginX, w: 85 },
-    { label: 'Status', x: marginX + 85, w: 110 },
-    { label: 'Customer', x: marginX + 195, w: 80 },
-    { label: 'Material', x: marginX + 275, w: 55 },
-    { label: 'Qty', x: marginX + 330, w: 28 },
-    { label: 'Driver', x: marginX + 358, w: 50 },
-    { label: 'Sched.', x: marginX + 408, w: 40 },
-    { label: 'Amount', x: marginX + 448, w: 40 },
+    { label: 'Order #', x: marginX, w: 78 },
+    { label: 'Status', x: marginX + 78, w: 95 },
+    { label: 'Customer', x: marginX + 173, w: 75 },
+    { label: 'Material', x: marginX + 248, w: 65 },
+    { label: 'Qty', x: marginX + 313, w: 42 },
+    { label: 'Driver', x: marginX + 355, w: 55 },
+    { label: 'Sched.', x: marginX + 410, w: 42 },
+    { label: 'Amount', x: marginX + 452, w: 48 },
   ];
   function tableHeader() {
     cols.forEach((c) => doc.text(c.x, y, c.label, { font: 'F2', size: 9 }));
@@ -1148,21 +1370,26 @@ function buildOpenOrdersReportPdf(orders, company = {}) {
     doc.text(marginX, y, 'Nothing open right now — every order is invoiced, cancelled, or refused.', { size: 10 });
   }
   orders.forEach((o) => {
-    const statusLines = wrapPdfText(OPEN_ORDER_STATUS_LABELS[o.status] || o.status || '', 20);
+    // wrapPdfText's own char-count wrapping is just a starting guess — it can
+    // still hand back a line too wide for the Status column's real point
+    // width (e.g. a long word), so each wrapped line goes through
+    // truncatePdfText too as a hard backstop.
+    const statusLines = wrapPdfText(OPEN_ORDER_STATUS_LABELS[o.status] || o.status || '', 18)
+      .map((line) => truncatePdfText(line, 'F1', 8, cols[1].w - 4));
     const rowHeight = Math.max(12, statusLines.length * 10);
     if (y - rowHeight < pageBottom) {
       doc.newPage();
       y = header('Open Orders Report (cont.)');
       tableHeader();
     }
-    doc.text(cols[0].x, y, o.order_number || '', { size: 8 });
+    doc.text(cols[0].x, y, truncatePdfText(o.order_number || '', 'F1', 8, cols[0].w - 4), { size: 8 });
     statusLines.forEach((line, i) => doc.text(cols[1].x, y - i * 10, line, { size: 8 }));
-    doc.text(cols[2].x, y, String(o.customer_name || '').slice(0, 16), { size: 8 });
-    doc.text(cols[3].x, y, String(o.material_name || '').slice(0, 12), { size: 8 });
-    doc.text(cols[4].x, y, `${o.quantity}${o.unit ? ' ' + o.unit : ''}`, { size: 8 });
-    doc.text(cols[5].x, y, String(o.driver_name || 'Unassign.').slice(0, 10), { size: 8 });
+    doc.text(cols[2].x, y, truncatePdfText(o.customer_name || '', 'F1', 8, cols[2].w - 4), { size: 8 });
+    doc.text(cols[3].x, y, truncatePdfText(o.material_name || '', 'F1', 8, cols[3].w - 4), { size: 8 });
+    doc.text(cols[4].x, y, truncatePdfText(`${o.quantity}${o.unit ? ' ' + o.unit : ''}`, 'F1', 8, cols[4].w - 4), { size: 8 });
+    doc.text(cols[5].x, y, truncatePdfText(o.driver_name || 'Unassign.', 'F1', 8, cols[5].w - 4), { size: 8 });
     doc.text(cols[6].x, y, o.scheduled_date ? formatDateOnlyShort(o.scheduled_date) : '—', { size: 8 });
-    doc.text(cols[7].x, y, `$${Number(o.total_amount || 0).toFixed(2)}`, { size: 8 });
+    doc.text(cols[7].x, y, truncatePdfText(`$${Number(o.total_amount || 0).toFixed(2)}`, 'F1', 8, cols[7].w - 4), { size: 8 });
     y -= rowHeight;
   });
 
@@ -3804,9 +4031,9 @@ on('GET', '/api/jobs/export.csv', async (req, res) => {
 on('POST', '/api/jobs/tracker-import', async (req, res) => {
   if (!requireOffice(req, res)) return;
   const b = await readJsonBody(req);
-  if (!b.csv) return sendJson(res, 400, { error: 'csv is required' });
+  if (!b.csv && !b.xlsx_base64) return sendJson(res, 400, { error: 'A CSV or Excel file is required' });
   let rows;
-  try { rows = csvToObjects(b.csv); } catch (e) { return sendJson(res, 400, { error: 'Could not parse that file as CSV' }); }
+  try { rows = rowsFromImportBody(b); } catch (e) { return sendJson(res, 400, { error: e.message || 'Could not parse that file — check it’s a .csv or .xlsx export' }); }
   if (!rows.length) return sendJson(res, 400, { error: 'No rows found in that file' });
   const STATUS_ALIASES = {
     'planning stage': 'planning_stage', 'in progress': 'in_progress', 'overdue balance': 'overdue_balance',
@@ -4090,9 +4317,9 @@ on('DELETE', '/api/job-equipment/:id', async (req, res, params) => {
 on('POST', '/api/jobs/import', async (req, res) => {
   if (!requireOffice(req, res)) return;
   const b = await readJsonBody(req);
-  if (!b.csv) return sendJson(res, 400, { error: 'csv is required' });
+  if (!b.csv && !b.xlsx_base64) return sendJson(res, 400, { error: 'A CSV or Excel file is required' });
   let rows;
-  try { rows = csvToObjects(b.csv); } catch (e) { return sendJson(res, 400, { error: 'Could not parse that file as CSV' }); }
+  try { rows = rowsFromImportBody(b); } catch (e) { return sendJson(res, 400, { error: e.message || 'Could not parse that file — check it’s a .csv or .xlsx export' }); }
   if (!rows.length) return sendJson(res, 400, { error: 'No rows found in that file' });
   const errors = []; const crewsCreated = new Set(); let imported = 0;
   rows.forEach((row, idx) => {
@@ -4127,9 +4354,9 @@ on('POST', '/api/jobs/import', async (req, res) => {
 on('POST', '/api/assets/import', async (req, res) => {
   if (!requireSection(req, res, 'can_view_assets')) return;
   const b = await readJsonBody(req);
-  if (!b.csv) return sendJson(res, 400, { error: 'csv is required' });
+  if (!b.csv && !b.xlsx_base64) return sendJson(res, 400, { error: 'A CSV or Excel file is required' });
   let rows;
-  try { rows = csvToObjects(b.csv); } catch (e) { return sendJson(res, 400, { error: 'Could not parse that file as CSV' }); }
+  try { rows = rowsFromImportBody(b); } catch (e) { return sendJson(res, 400, { error: e.message || 'Could not parse that file — check it’s a .csv or .xlsx export' }); }
   if (!rows.length) return sendJson(res, 400, { error: 'No rows found in that file' });
   const ASSET_CATEGORIES = ['equipment', 'truck', 'vehicle', 'tool', 'other'];
   const ASSET_CONDITIONS = ['excellent', 'good', 'fair', 'poor'];
@@ -4163,9 +4390,9 @@ on('POST', '/api/assets/import', async (req, res) => {
 on('POST', '/api/orders/import', async (req, res) => {
   if (!requireOffice(req, res)) return;
   const b = await readJsonBody(req);
-  if (!b.csv) return sendJson(res, 400, { error: 'csv is required' });
+  if (!b.csv && !b.xlsx_base64) return sendJson(res, 400, { error: 'A CSV or Excel file is required' });
   let rows;
-  try { rows = csvToObjects(b.csv); } catch (e) { return sendJson(res, 400, { error: 'Could not parse that file as CSV' }); }
+  try { rows = rowsFromImportBody(b); } catch (e) { return sendJson(res, 400, { error: e.message || 'Could not parse that file — check it’s a .csv or .xlsx export' }); }
   if (!rows.length) return sendJson(res, 400, { error: 'No rows found in that file' });
   const errors = []; const customersCreated = new Set(); const materialsCreated = new Set(); let imported = 0;
   rows.forEach((row, idx) => {
@@ -4565,7 +4792,7 @@ const STATIC_FILES = {
   },
   "reports.html": {
     "encoding": "utf8",
-    "content": "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"UTF-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>Reports — OPD Development Corp</title>\n<link rel=\"icon\" href=\"/favicon.png\">\n<link rel=\"apple-touch-icon\" href=\"/img/apple-touch-icon.png\">\n<meta name=\"apple-mobile-web-app-title\" content=\"OPD\">\n<link rel=\"stylesheet\" href=\"/css/style.css\">\n<style>\n  .error-list { max-height: 220px; overflow-y: auto; margin-top: 10px; }\n  .error-list div { padding: 4px 0; border-bottom: 1px solid var(--line); font-size: 13px; color: var(--ink-soft); }\n  .template-link { font-size: 13px; }\n  .download-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }\n  .download-card { border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; background: var(--panel-raised); }\n  .download-card h3 { margin: 0 0 4px; font-size: 15px; }\n  .download-card p { margin: 0 0 12px; font-size: 13px; color: var(--ink-soft); }\n  .shifts-table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }\n  .shifts-table th, .shifts-table td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }\n  .shifts-table tbody tr:hover { background: var(--panel-raised); }\n  .shift-cash { font-weight: 600; }\n  .open-shift-badge { font-size: 11px; color: var(--status-good,#15803d); font-weight: 600; }\n</style>\n</head>\n<body class=\"with-sidebar\">\n<div class=\"sidebar\">\n  <a class=\"brand\" href=\"/dashboard.html\"><img src=\"/img/logo.png\" alt=\"OPD\"> OPD Development Corp</a>\n  <nav>\n    <a href=\"/dashboard.html\">Dashboard</a>\n    <div class=\"nav-group-label\">Material Deliveries</div>\n    <a href=\"/new-order.html\">New Order</a>\n    <a href=\"/quote.html\">Quote</a>\n    <a href=\"/schedule.html\">Schedule</a>\n    <a href=\"/schedule-text.html\">Driver Text</a>\n    <a href=\"/orders-database.html\">All Orders</a>\n    <a href=\"/customers.html\">Customers</a>\n    <a href=\"/jobs.html\">Projects</a>\n    <a href=\"/job-tracker.html\">Job Tracker</a>\n    <div class=\"nav-group-label\">Administrative &amp; Financial</div>\n    <a href=\"/invoices.html\">Invoicing</a>\n    <a href=\"/financial.html\">Financials</a>\n    <a href=\"/assets.html\">Assets</a>\n    <a href=\"/real-estate.html\">Real Estate</a>\n    <a href=\"/reports.html\">Reports</a>\n    <a href=\"/admin.html\">Admin</a>\n    <a href=\"/users.html\">User Accounts</a>\n    <a href=\"/audit-log.html\" class=\"super-admin-only\">Audit Log</a>\n  </nav>\n  <div class=\"who\" id=\"topbar-who\"></div>\n</div>\n\n<div class=\"container\">\n  <h1>Reports</h1>\n  <p class=\"subtitle\">Everything for getting data in and out of the app, in one place — downloads on the left, uploads below.</p>\n\n  <div class=\"panel\">\n    <h2>Downloads</h2>\n    <div class=\"download-grid\">\n      <div class=\"download-card\">\n        <h3>All Orders</h3>\n        <p>Every order on file, with customer, material, driver, and status.</p>\n        <a class=\"btn secondary\" href=\"/api/orders/export.csv\">Download CSV</a>\n      </div>\n      <div class=\"download-card\">\n        <h3>Customers</h3>\n        <p>Every customer, with order/job counts and lifetime revenue.</p>\n        <a class=\"btn secondary\" href=\"/api/customers/export.csv\">Download CSV</a>\n      </div>\n      <div class=\"download-card\">\n        <h3>Job Tracker</h3>\n        <p>Every job's board status, type, and billed/paid state — same columns as <a href=\"/job-tracker.html\">Job Tracker</a>, re-importable as-is.</p>\n        <a class=\"btn secondary\" href=\"/api/jobs/export.csv\">Download CSV</a>\n      </div>\n      <div class=\"download-card\">\n        <h3>Open Orders Report</h3>\n        <p>Everything not yet invoiced, cancelled, or refused — new, scheduled, out for delivery, and delivered-but-not-invoiced — as a printable PDF.</p>\n        <a class=\"btn secondary\" href=\"/api/orders/open-report.pdf\">Download PDF</a>\n      </div>\n      <div class=\"download-card\">\n        <h3>Driver Day Report</h3>\n        <p>One page per driver, their stops for the day — a printable handout. Need it in text form instead? Head to <a href=\"/schedule-text.html\">Driver Text</a>.</p>\n        <div class=\"field-row\" style=\"align-items:flex-end; margin-bottom:10px;\">\n          <div class=\"field\" style=\"max-width:150px;\">\n            <label>Date</label>\n            <input type=\"date\" id=\"driver-report-date\">\n          </div>\n          <div class=\"field\" style=\"max-width:170px;\">\n            <label>Driver</label>\n            <select id=\"driver-report-driver\"><option value=\"\">All drivers</option></select>\n          </div>\n        </div>\n        <a class=\"btn secondary\" id=\"driver-report-link\" href=\"#\">Download PDF</a>\n      </div>\n      <div class=\"download-card\">\n        <h3>Financial Report</h3>\n        <p>Summary + full order ledger, formatted as a printable PDF.</p>\n        <div class=\"field-row\" style=\"align-items:flex-end; margin-bottom:10px;\">\n          <div class=\"field\" style=\"max-width:140px;\">\n            <label>Months back</label>\n            <select id=\"report-months\">\n              <option value=\"3\">3</option>\n              <option value=\"6\">6</option>\n              <option value=\"12\" selected>12</option>\n              <option value=\"24\">24</option>\n              <option value=\"0\">All time</option>\n            </select>\n          </div>\n        </div>\n        <a class=\"btn secondary\" id=\"report-pdf-link\" href=\"/api/financial/report.pdf?months=12\">Download PDF Report</a>\n      </div>\n    </div>\n  </div>\n\n  <div class=\"panel\">\n    <h2>Driver Time Clock</h2>\n    <p class=\"subtitle\">Shift history — hours worked, deliveries, and cash/check/other collected. Download the PDF report for the amount each driver should be turning in.</p>\n    <div class=\"field-row\" style=\"align-items:flex-end;\">\n      <div class=\"field\" style=\"max-width:220px;\">\n        <label>Driver</label>\n        <select id=\"shifts-driver-filter\"><option value=\"\">All drivers</option></select>\n      </div>\n      <div class=\"field\" style=\"max-width:180px;\">\n        <label>Date</label>\n        <input type=\"date\" id=\"shifts-date-filter\">\n      </div>\n      <div class=\"field\" style=\"flex:none;\"><button type=\"button\" class=\"btn secondary\" id=\"shifts-clear-filter\">Clear</button></div>\n    </div>\n    <div style=\"overflow-x:auto;\">\n      <table class=\"shifts-table\">\n        <thead>\n          <tr>\n            <th>Driver</th><th>Clock In</th><th>Clock Out</th><th>Hours</th>\n            <th>Loads</th><th>Cash</th><th>Check</th><th>Other</th><th>Total</th><th>Report</th>\n          </tr>\n        </thead>\n        <tbody id=\"shifts-tbody\"></tbody>\n      </table>\n      <div class=\"empty\" id=\"shifts-empty-msg\" style=\"display:none;\">No shifts found.</div>\n    </div>\n  </div>\n\n  <div class=\"panel\">\n    <h2>Import Data</h2>\n    <p class=\"subtitle\">This app doesn't read .xlsx directly — export your spreadsheet to CSV first (in Excel or Google Sheets: File → Save As / Download → CSV), then upload it here.</p>\n\n    <h3>Import Projects</h3>\n    <p class=\"subtitle\" style=\"margin-bottom:10px;\">Bring in your projects for the year. Column headers are matched loosely (case/spacing don't matter) — recognized columns: <code>customer_name, customer_phone, site_address, scope, price, target_start_date, duration_days, crew, status, permit_number, notes</code>. A crew name that doesn't exist yet is created automatically.</p>\n    <p class=\"template-link\"><a href=\"#\" id=\"download-jobs-template\">Download a blank CSV template</a></p>\n    <div class=\"field-row\" style=\"align-items:flex-end;\">\n      <div class=\"field\" style=\"flex:2;\"><label>CSV File</label><input type=\"file\" id=\"jobs-csv-file\" accept=\".csv,text/csv\"></div>\n      <div class=\"field\" style=\"flex:none;\"><button type=\"button\" id=\"import-jobs-btn\">Import</button></div>\n    </div>\n    <div id=\"jobs-import-result\"></div>\n  </div>\n\n  <div class=\"panel\">\n    <h3>Import Historical Material Sales</h3>\n    <p class=\"subtitle\" style=\"margin-bottom:10px;\">Bring in past material orders so they show up in your records and financial reports. Recognized columns: <code>customer_name, customer_phone, material_name, quantity, unit, price_per_unit, delivery_address, delivery_fee, sales_tax_rate, order_date, driver_name, status, notes</code>. A customer or material that doesn't exist yet is created automatically. <code>order_date</code> and <code>quantity</code> are required for every row.</p>\n    <p class=\"template-link\"><a href=\"#\" id=\"download-sales-template\">Download a blank CSV template</a></p>\n    <div class=\"field-row\" style=\"align-items:flex-end;\">\n      <div class=\"field\" style=\"flex:2;\"><label>CSV File</label><input type=\"file\" id=\"sales-csv-file\" accept=\".csv,text/csv\"></div>\n      <div class=\"field\" style=\"flex:none;\"><button type=\"button\" id=\"import-sales-btn\">Import</button></div>\n    </div>\n    <div id=\"sales-import-result\"></div>\n  </div>\n\n  <div class=\"panel\">\n    <h3>Import Job Tracker</h3>\n    <p class=\"subtitle\" style=\"margin-bottom:10px;\">Bring in or update the <a href=\"/job-tracker.html\">Job Tracker</a> board in bulk — matched by <code>Job Number</code>, so re-importing the same file with updated statuses updates those jobs instead of duplicating them. Recognized columns: <code>Job Number, Job Address/Scope, Type of Job, Status, Billed, Paid, Notes</code>. <code>Status</code> accepts the board names as written (Planning Stage, In Progress, Overdue Balance, Awarded, For Bid, Job Completed, Trash); <code>Billed</code>/<code>Paid</code> accept Yes/No. Only <code>Job Number</code> is required.</p>\n    <p class=\"template-link\"><a href=\"#\" id=\"download-tracker-template\">Download a blank CSV template</a></p>\n    <div class=\"field-row\" style=\"align-items:flex-end;\">\n      <div class=\"field\" style=\"flex:2;\"><label>CSV File</label><input type=\"file\" id=\"tracker-csv-file\" accept=\".csv,text/csv\"></div>\n      <div class=\"field\" style=\"flex:none;\"><button type=\"button\" id=\"import-tracker-btn\">Import</button></div>\n    </div>\n    <div id=\"tracker-import-result\"></div>\n  </div>\n\n  <div class=\"panel\">\n    <h3>Import Equipment &amp; Assets</h3>\n    <p class=\"subtitle\" style=\"margin-bottom:10px;\">Bring in your equipment, trucks, vehicles, and tools in bulk. Recognized columns: <code>name, category, make, model, year, serial_vin, purchase_date, purchase_price, condition, location, estimated_value, debt_balance, debt_lender, notes</code>. <code>category</code> must be one of equipment/truck/vehicle/tool/other (defaults to equipment); <code>condition</code> must be one of excellent/good/fair/poor (defaults to good). Only <code>name</code> is required.</p>\n    <p class=\"template-link\"><a href=\"#\" id=\"download-assets-template\">Download a blank CSV template</a></p>\n    <div class=\"field-row\" style=\"align-items:flex-end;\">\n      <div class=\"field\" style=\"flex:2;\"><label>CSV File</label><input type=\"file\" id=\"assets-csv-file\" accept=\".csv,text/csv\"></div>\n      <div class=\"field\" style=\"flex:none;\"><button type=\"button\" id=\"import-assets-btn\">Import</button></div>\n    </div>\n    <div id=\"assets-import-result\"></div>\n  </div>\n</div>\n\n<script src=\"/js/app.js\"></script>\n<script>\n(async function () {\n  const me = await requireSession(['office']);\n  if (!me) return;\n\n  // ---- Driver Time Clock panel ----\n  function fmtTimestamp(str) {\n    if (!str) return '—';\n    // Server timestamps are UTC \"YYYY-MM-DD HH:MM:SS\" with no timezone marker.\n    const d = new Date(String(str).replace(' ', 'T') + 'Z');\n    return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });\n  }\n  async function loadShiftsPanel() {\n    const driverId = document.getElementById('shifts-driver-filter').value;\n    const date = document.getElementById('shifts-date-filter').value;\n    const params = new URLSearchParams();\n    if (driverId) params.set('driver_id', driverId);\n    if (date) params.set('date', date);\n    const shifts = await api(`/api/driver/shifts${params.toString() ? '?' + params.toString() : ''}`);\n    const tbody = document.getElementById('shifts-tbody');\n    document.getElementById('shifts-empty-msg').style.display = shifts.length ? 'none' : 'block';\n    tbody.innerHTML = shifts.map(s => `\n      <tr>\n        <td>${escapeHtml(s.driver_name)}</td>\n        <td>${fmtTimestamp(s.clock_in)}</td>\n        <td>${s.clock_out ? fmtTimestamp(s.clock_out) : '<span class=\"open-shift-badge\">Still clocked in</span>'}</td>\n        <td>${Number(s.stats.hours || 0).toFixed(2)}</td>\n        <td>${s.stats.deliveredCount}</td>\n        <td>$${Number(s.stats.cashTotal || 0).toFixed(2)}</td>\n        <td>$${Number(s.stats.checkTotal || 0).toFixed(2)}</td>\n        <td>$${Number(s.stats.otherTotal || 0).toFixed(2)}</td>\n        <td class=\"shift-cash\">$${Number(s.stats.grandCollected || 0).toFixed(2)}</td>\n        <td><a class=\"btn secondary small\" href=\"/api/driver/shifts/${s.id}/report.pdf\" target=\"_blank\">View PDF</a></td>\n      </tr>\n    `).join('');\n  }\n  async function loadDriverFilterOptions() {\n    const drivers = await api('/api/drivers');\n    const sel = document.getElementById('shifts-driver-filter');\n    drivers.filter(d => d.active).forEach(d => {\n      const opt = document.createElement('option');\n      opt.value = d.id; opt.textContent = d.name;\n      sel.appendChild(opt);\n    });\n  }\n  document.getElementById('shifts-driver-filter').addEventListener('change', loadShiftsPanel);\n  document.getElementById('shifts-date-filter').addEventListener('change', loadShiftsPanel);\n  document.getElementById('shifts-clear-filter').addEventListener('click', () => {\n    document.getElementById('shifts-driver-filter').value = '';\n    document.getElementById('shifts-date-filter').value = '';\n    loadShiftsPanel();\n  });\n  loadDriverFilterOptions().then(loadShiftsPanel);\n\n  // ---- Driver Day Report (PDF) ----\n  function localIsoDate(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; }\n  function updateDriverReportLink() {\n    const date = document.getElementById('driver-report-date').value || localIsoDate(new Date());\n    const driverId = document.getElementById('driver-report-driver').value;\n    const params = new URLSearchParams({ date });\n    if (driverId) params.set('driver_id', driverId);\n    document.getElementById('driver-report-link').href = `/api/deliveries/driver-report.pdf?${params.toString()}`;\n  }\n  document.getElementById('driver-report-date').value = localIsoDate(new Date());\n  document.getElementById('driver-report-date').addEventListener('change', updateDriverReportLink);\n  document.getElementById('driver-report-driver').addEventListener('change', updateDriverReportLink);\n  api('/api/drivers').then(drivers => {\n    const sel = document.getElementById('driver-report-driver');\n    drivers.filter(d => d.active).forEach(d => {\n      const opt = document.createElement('option');\n      opt.value = d.id; opt.textContent = d.name;\n      sel.appendChild(opt);\n    });\n    updateDriverReportLink();\n  });\n\n  document.getElementById('report-months').addEventListener('change', (e) => {\n    const months = e.target.value;\n    const href = months === '0' ? '/api/financial/report.pdf' : `/api/financial/report.pdf?months=${months}`;\n    document.getElementById('report-pdf-link').href = href;\n  });\n\n  function downloadCsv(filename, header) {\n    const blob = new Blob([header + '\\n'], { type: 'text/csv' });\n    const url = URL.createObjectURL(blob);\n    const a = document.createElement('a');\n    a.href = url; a.download = filename;\n    document.body.appendChild(a); a.click(); a.remove();\n    URL.revokeObjectURL(url);\n  }\n  document.getElementById('download-jobs-template').addEventListener('click', (e) => {\n    e.preventDefault();\n    downloadCsv('jobs-template.csv', 'customer_name,customer_phone,site_address,scope,price,target_start_date,duration_days,crew,status,permit_number,notes');\n  });\n  document.getElementById('download-sales-template').addEventListener('click', (e) => {\n    e.preventDefault();\n    downloadCsv('sales-template.csv', 'customer_name,customer_phone,material_name,quantity,unit,price_per_unit,delivery_address,delivery_fee,sales_tax_rate,order_date,driver_name,status,notes');\n  });\n  document.getElementById('download-assets-template').addEventListener('click', (e) => {\n    e.preventDefault();\n    downloadCsv('assets-template.csv', 'name,category,make,model,year,serial_vin,purchase_date,purchase_price,condition,location,estimated_value,debt_balance,debt_lender,notes');\n  });\n  document.getElementById('download-tracker-template').addEventListener('click', (e) => {\n    e.preventDefault();\n    downloadCsv('job-tracker-template.csv', 'Job Number,Job Address/Scope,Type of Job,Status,Billed,Paid,Notes');\n  });\n\n  function readFileAsText(file) {\n    return new Promise((resolve, reject) => {\n      const reader = new FileReader();\n      reader.onload = () => resolve(String(reader.result));\n      reader.onerror = reject;\n      reader.readAsText(file);\n    });\n  }\n\n  function renderResult(el, res, noun) {\n    const parts = [`<div class=\"ok-msg\">Imported ${res.imported} ${noun}.</div>`];\n    if (res.crewsCreated && res.crewsCreated.length) parts.push(`<div class=\"subtitle\">New crews created: ${res.crewsCreated.map(escapeHtml).join(', ')}</div>`);\n    if (res.customersCreated && res.customersCreated.length) parts.push(`<div class=\"subtitle\">New customers created: ${res.customersCreated.length}</div>`);\n    if (res.materialsCreated && res.materialsCreated.length) parts.push(`<div class=\"subtitle\">New materials created: ${res.materialsCreated.map(escapeHtml).join(', ')}</div>`);\n    if (res.errors && res.errors.length) {\n      parts.push(`<div class=\"error-msg\" style=\"margin-top:8px;\">${res.errors.length} row(s) had issues:</div>`);\n      parts.push(`<div class=\"error-list\">${res.errors.map(e => `<div>Row ${e.row}: ${escapeHtml(e.reason)}</div>`).join('')}</div>`);\n    }\n    el.innerHTML = parts.join('');\n  }\n\n  document.getElementById('import-jobs-btn').addEventListener('click', async () => {\n    const el = document.getElementById('jobs-import-result');\n    const file = document.getElementById('jobs-csv-file').files[0];\n    if (!file) { el.innerHTML = '<div class=\"error-msg\">Choose a CSV file first.</div>'; return; }\n    el.innerHTML = '<div class=\"subtitle\">Importing…</div>';\n    try {\n      const csv = await readFileAsText(file);\n      const res = await api('/api/jobs/import', { method: 'POST', body: { csv } });\n      renderResult(el, res, 'project(s)');\n    } catch (err) {\n      el.innerHTML = `<div class=\"error-msg\">${err.message}</div>`;\n    }\n  });\n\n  document.getElementById('import-sales-btn').addEventListener('click', async () => {\n    const el = document.getElementById('sales-import-result');\n    const file = document.getElementById('sales-csv-file').files[0];\n    if (!file) { el.innerHTML = '<div class=\"error-msg\">Choose a CSV file first.</div>'; return; }\n    el.innerHTML = '<div class=\"subtitle\">Importing…</div>';\n    try {\n      const csv = await readFileAsText(file);\n      const res = await api('/api/orders/import', { method: 'POST', body: { csv } });\n      renderResult(el, res, 'order(s)');\n    } catch (err) {\n      el.innerHTML = `<div class=\"error-msg\">${err.message}</div>`;\n    }\n  });\n\n  document.getElementById('import-assets-btn').addEventListener('click', async () => {\n    const el = document.getElementById('assets-import-result');\n    const file = document.getElementById('assets-csv-file').files[0];\n    if (!file) { el.innerHTML = '<div class=\"error-msg\">Choose a CSV file first.</div>'; return; }\n    el.innerHTML = '<div class=\"subtitle\">Importing…</div>';\n    try {\n      const csv = await readFileAsText(file);\n      const res = await api('/api/assets/import', { method: 'POST', body: { csv } });\n      renderResult(el, res, 'asset(s)');\n    } catch (err) {\n      el.innerHTML = `<div class=\"error-msg\">${err.message}</div>`;\n    }\n  });\n\n  document.getElementById('import-tracker-btn').addEventListener('click', async () => {\n    const el = document.getElementById('tracker-import-result');\n    const file = document.getElementById('tracker-csv-file').files[0];\n    if (!file) { el.innerHTML = '<div class=\"error-msg\">Choose a CSV file first.</div>'; return; }\n    el.innerHTML = '<div class=\"subtitle\">Importing…</div>';\n    try {\n      const csv = await readFileAsText(file);\n      const res = await api('/api/jobs/tracker-import', { method: 'POST', body: { csv } });\n      const parts = [`<div class=\"ok-msg\">${res.created} job(s) created, ${res.updated} updated.</div>`];\n      if (res.errors && res.errors.length) {\n        parts.push(`<div class=\"error-msg\" style=\"margin-top:8px;\">${res.errors.length} row(s) had issues:</div>`);\n        parts.push(`<div class=\"error-list\">${res.errors.map(e => `<div>Row ${e.row}: ${escapeHtml(e.reason)}</div>`).join('')}</div>`);\n      }\n      el.innerHTML = parts.join('');\n    } catch (err) {\n      el.innerHTML = `<div class=\"error-msg\">${err.message}</div>`;\n    }\n  });\n})();\n</script>\n</body>\n</html>\n"
+    "content": "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"UTF-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>Reports — OPD Development Corp</title>\n<link rel=\"icon\" href=\"/favicon.png\">\n<link rel=\"apple-touch-icon\" href=\"/img/apple-touch-icon.png\">\n<meta name=\"apple-mobile-web-app-title\" content=\"OPD\">\n<link rel=\"stylesheet\" href=\"/css/style.css\">\n<style>\n  .error-list { max-height: 220px; overflow-y: auto; margin-top: 10px; }\n  .error-list div { padding: 4px 0; border-bottom: 1px solid var(--line); font-size: 13px; color: var(--ink-soft); }\n  .template-link { font-size: 13px; }\n  .download-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }\n  .download-card { border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; background: var(--panel-raised); }\n  .download-card h3 { margin: 0 0 4px; font-size: 15px; }\n  .download-card p { margin: 0 0 12px; font-size: 13px; color: var(--ink-soft); }\n  .shifts-table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }\n  .shifts-table th, .shifts-table td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }\n  .shifts-table tbody tr:hover { background: var(--panel-raised); }\n  .shift-cash { font-weight: 600; }\n  .open-shift-badge { font-size: 11px; color: var(--status-good,#15803d); font-weight: 600; }\n</style>\n</head>\n<body class=\"with-sidebar\">\n<div class=\"sidebar\">\n  <a class=\"brand\" href=\"/dashboard.html\"><img src=\"/img/logo.png\" alt=\"OPD\"> OPD Development Corp</a>\n  <nav>\n    <a href=\"/dashboard.html\">Dashboard</a>\n    <div class=\"nav-group-label\">Material Deliveries</div>\n    <a href=\"/new-order.html\">New Order</a>\n    <a href=\"/quote.html\">Quote</a>\n    <a href=\"/schedule.html\">Schedule</a>\n    <a href=\"/schedule-text.html\">Driver Text</a>\n    <a href=\"/orders-database.html\">All Orders</a>\n    <a href=\"/customers.html\">Customers</a>\n    <a href=\"/jobs.html\">Projects</a>\n    <a href=\"/job-tracker.html\">Job Tracker</a>\n    <div class=\"nav-group-label\">Administrative &amp; Financial</div>\n    <a href=\"/invoices.html\">Invoicing</a>\n    <a href=\"/financial.html\">Financials</a>\n    <a href=\"/assets.html\">Assets</a>\n    <a href=\"/real-estate.html\">Real Estate</a>\n    <a href=\"/reports.html\">Reports</a>\n    <a href=\"/admin.html\">Admin</a>\n    <a href=\"/users.html\">User Accounts</a>\n    <a href=\"/audit-log.html\" class=\"super-admin-only\">Audit Log</a>\n  </nav>\n  <div class=\"who\" id=\"topbar-who\"></div>\n</div>\n\n<div class=\"container\">\n  <h1>Reports</h1>\n  <p class=\"subtitle\">Everything for getting data in and out of the app, in one place — downloads on the left, uploads below.</p>\n\n  <div class=\"panel\">\n    <h2>Downloads</h2>\n    <div class=\"download-grid\">\n      <div class=\"download-card\">\n        <h3>All Orders</h3>\n        <p>Every order on file, with customer, material, driver, and status.</p>\n        <a class=\"btn secondary\" href=\"/api/orders/export.csv\">Download CSV</a>\n      </div>\n      <div class=\"download-card\">\n        <h3>Customers</h3>\n        <p>Every customer, with order/job counts and lifetime revenue.</p>\n        <a class=\"btn secondary\" href=\"/api/customers/export.csv\">Download CSV</a>\n      </div>\n      <div class=\"download-card\">\n        <h3>Job Tracker</h3>\n        <p>Every job's board status, type, and billed/paid state — same columns as <a href=\"/job-tracker.html\">Job Tracker</a>, re-importable as-is.</p>\n        <a class=\"btn secondary\" href=\"/api/jobs/export.csv\">Download CSV</a>\n      </div>\n      <div class=\"download-card\">\n        <h3>Open Orders Report</h3>\n        <p>Everything not yet invoiced, cancelled, or refused — new, scheduled, out for delivery, and delivered-but-not-invoiced — as a printable PDF.</p>\n        <a class=\"btn secondary\" href=\"/api/orders/open-report.pdf\">Download PDF</a>\n      </div>\n      <div class=\"download-card\">\n        <h3>Driver Day Report</h3>\n        <p>One page per driver, their stops for the day — a printable handout. Need it in text form instead? Head to <a href=\"/schedule-text.html\">Driver Text</a>.</p>\n        <div class=\"field-row\" style=\"align-items:flex-end; margin-bottom:10px;\">\n          <div class=\"field\" style=\"max-width:150px;\">\n            <label>Date</label>\n            <input type=\"date\" id=\"driver-report-date\">\n          </div>\n          <div class=\"field\" style=\"max-width:170px;\">\n            <label>Driver</label>\n            <select id=\"driver-report-driver\"><option value=\"\">All drivers</option></select>\n          </div>\n        </div>\n        <a class=\"btn secondary\" id=\"driver-report-link\" href=\"#\">Download PDF</a>\n      </div>\n      <div class=\"download-card\">\n        <h3>Financial Report</h3>\n        <p>Summary + full order ledger, formatted as a printable PDF.</p>\n        <div class=\"field-row\" style=\"align-items:flex-end; margin-bottom:10px;\">\n          <div class=\"field\" style=\"max-width:140px;\">\n            <label>Months back</label>\n            <select id=\"report-months\">\n              <option value=\"3\">3</option>\n              <option value=\"6\">6</option>\n              <option value=\"12\" selected>12</option>\n              <option value=\"24\">24</option>\n              <option value=\"0\">All time</option>\n            </select>\n          </div>\n        </div>\n        <a class=\"btn secondary\" id=\"report-pdf-link\" href=\"/api/financial/report.pdf?months=12\">Download PDF Report</a>\n      </div>\n    </div>\n  </div>\n\n  <div class=\"panel\">\n    <h2>Driver Time Clock</h2>\n    <p class=\"subtitle\">Shift history — hours worked, deliveries, and cash/check/other collected. Download the PDF report for the amount each driver should be turning in.</p>\n    <div class=\"field-row\" style=\"align-items:flex-end;\">\n      <div class=\"field\" style=\"max-width:220px;\">\n        <label>Driver</label>\n        <select id=\"shifts-driver-filter\"><option value=\"\">All drivers</option></select>\n      </div>\n      <div class=\"field\" style=\"max-width:180px;\">\n        <label>Date</label>\n        <input type=\"date\" id=\"shifts-date-filter\">\n      </div>\n      <div class=\"field\" style=\"flex:none;\"><button type=\"button\" class=\"btn secondary\" id=\"shifts-clear-filter\">Clear</button></div>\n    </div>\n    <div style=\"overflow-x:auto;\">\n      <table class=\"shifts-table\">\n        <thead>\n          <tr>\n            <th>Driver</th><th>Clock In</th><th>Clock Out</th><th>Hours</th>\n            <th>Loads</th><th>Cash</th><th>Check</th><th>Other</th><th>Total</th><th>Report</th>\n          </tr>\n        </thead>\n        <tbody id=\"shifts-tbody\"></tbody>\n      </table>\n      <div class=\"empty\" id=\"shifts-empty-msg\" style=\"display:none;\">No shifts found.</div>\n    </div>\n  </div>\n\n  <div class=\"panel\">\n    <h2>Import Data</h2>\n    <p class=\"subtitle\">Upload a .csv, or an .xlsx export straight from Excel or Google Sheets (File → Download → Microsoft Excel) — no need to save as CSV first.</p>\n\n    <h3>Import Projects</h3>\n    <p class=\"subtitle\" style=\"margin-bottom:10px;\">Bring in your projects for the year. Column headers are matched loosely (case/spacing don't matter) — recognized columns: <code>customer_name, customer_phone, site_address, scope, price, target_start_date, duration_days, crew, status, permit_number, notes</code>. A crew name that doesn't exist yet is created automatically.</p>\n    <p class=\"template-link\"><a href=\"#\" id=\"download-jobs-template\">Download a blank CSV template</a></p>\n    <div class=\"field-row\" style=\"align-items:flex-end;\">\n      <div class=\"field\" style=\"flex:2;\"><label>CSV or Excel File</label><input type=\"file\" id=\"jobs-csv-file\" accept=\".csv,text/csv,.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\"></div>\n      <div class=\"field\" style=\"flex:none;\"><button type=\"button\" id=\"import-jobs-btn\">Import</button></div>\n    </div>\n    <div id=\"jobs-import-result\"></div>\n  </div>\n\n  <div class=\"panel\">\n    <h3>Import Historical Material Sales</h3>\n    <p class=\"subtitle\" style=\"margin-bottom:10px;\">Bring in past material orders so they show up in your records and financial reports. Recognized columns: <code>customer_name, customer_phone, material_name, quantity, unit, price_per_unit, delivery_address, delivery_fee, sales_tax_rate, order_date, driver_name, status, notes</code>. A customer or material that doesn't exist yet is created automatically. <code>order_date</code> and <code>quantity</code> are required for every row.</p>\n    <p class=\"template-link\"><a href=\"#\" id=\"download-sales-template\">Download a blank CSV template</a></p>\n    <div class=\"field-row\" style=\"align-items:flex-end;\">\n      <div class=\"field\" style=\"flex:2;\"><label>CSV or Excel File</label><input type=\"file\" id=\"sales-csv-file\" accept=\".csv,text/csv,.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\"></div>\n      <div class=\"field\" style=\"flex:none;\"><button type=\"button\" id=\"import-sales-btn\">Import</button></div>\n    </div>\n    <div id=\"sales-import-result\"></div>\n  </div>\n\n  <div class=\"panel\">\n    <h3>Import Job Tracker</h3>\n    <p class=\"subtitle\" style=\"margin-bottom:10px;\">Bring in or update the <a href=\"/job-tracker.html\">Job Tracker</a> board in bulk — matched by <code>Job Number</code>, so re-importing the same file with updated statuses updates those jobs instead of duplicating them. Recognized columns: <code>Job Number, Job Address/Scope, Type of Job, Status, Billed, Paid, Notes</code>. <code>Status</code> accepts the board names as written (Planning Stage, In Progress, Overdue Balance, Awarded, For Bid, Job Completed, Trash); <code>Billed</code>/<code>Paid</code> accept Yes/No. Only <code>Job Number</code> is required.</p>\n    <p class=\"template-link\"><a href=\"#\" id=\"download-tracker-template\">Download a blank CSV template</a></p>\n    <div class=\"field-row\" style=\"align-items:flex-end;\">\n      <div class=\"field\" style=\"flex:2;\"><label>CSV or Excel File</label><input type=\"file\" id=\"tracker-csv-file\" accept=\".csv,text/csv,.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\"></div>\n      <div class=\"field\" style=\"flex:none;\"><button type=\"button\" id=\"import-tracker-btn\">Import</button></div>\n    </div>\n    <div id=\"tracker-import-result\"></div>\n  </div>\n\n  <div class=\"panel\">\n    <h3>Import Equipment &amp; Assets</h3>\n    <p class=\"subtitle\" style=\"margin-bottom:10px;\">Bring in your equipment, trucks, vehicles, and tools in bulk. Recognized columns: <code>name, category, make, model, year, serial_vin, purchase_date, purchase_price, condition, location, estimated_value, debt_balance, debt_lender, notes</code>. <code>category</code> must be one of equipment/truck/vehicle/tool/other (defaults to equipment); <code>condition</code> must be one of excellent/good/fair/poor (defaults to good). Only <code>name</code> is required.</p>\n    <p class=\"template-link\"><a href=\"#\" id=\"download-assets-template\">Download a blank CSV template</a></p>\n    <div class=\"field-row\" style=\"align-items:flex-end;\">\n      <div class=\"field\" style=\"flex:2;\"><label>CSV or Excel File</label><input type=\"file\" id=\"assets-csv-file\" accept=\".csv,text/csv,.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\"></div>\n      <div class=\"field\" style=\"flex:none;\"><button type=\"button\" id=\"import-assets-btn\">Import</button></div>\n    </div>\n    <div id=\"assets-import-result\"></div>\n  </div>\n</div>\n\n<script src=\"/js/app.js\"></script>\n<script>\n(async function () {\n  const me = await requireSession(['office']);\n  if (!me) return;\n\n  // ---- Driver Time Clock panel ----\n  function fmtTimestamp(str) {\n    if (!str) return '—';\n    // Server timestamps are UTC \"YYYY-MM-DD HH:MM:SS\" with no timezone marker.\n    const d = new Date(String(str).replace(' ', 'T') + 'Z');\n    return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });\n  }\n  async function loadShiftsPanel() {\n    const driverId = document.getElementById('shifts-driver-filter').value;\n    const date = document.getElementById('shifts-date-filter').value;\n    const params = new URLSearchParams();\n    if (driverId) params.set('driver_id', driverId);\n    if (date) params.set('date', date);\n    const shifts = await api(`/api/driver/shifts${params.toString() ? '?' + params.toString() : ''}`);\n    const tbody = document.getElementById('shifts-tbody');\n    document.getElementById('shifts-empty-msg').style.display = shifts.length ? 'none' : 'block';\n    tbody.innerHTML = shifts.map(s => `\n      <tr>\n        <td>${escapeHtml(s.driver_name)}</td>\n        <td>${fmtTimestamp(s.clock_in)}</td>\n        <td>${s.clock_out ? fmtTimestamp(s.clock_out) : '<span class=\"open-shift-badge\">Still clocked in</span>'}</td>\n        <td>${Number(s.stats.hours || 0).toFixed(2)}</td>\n        <td>${s.stats.deliveredCount}</td>\n        <td>$${Number(s.stats.cashTotal || 0).toFixed(2)}</td>\n        <td>$${Number(s.stats.checkTotal || 0).toFixed(2)}</td>\n        <td>$${Number(s.stats.otherTotal || 0).toFixed(2)}</td>\n        <td class=\"shift-cash\">$${Number(s.stats.grandCollected || 0).toFixed(2)}</td>\n        <td><a class=\"btn secondary small\" href=\"/api/driver/shifts/${s.id}/report.pdf\" target=\"_blank\">View PDF</a></td>\n      </tr>\n    `).join('');\n  }\n  async function loadDriverFilterOptions() {\n    const drivers = await api('/api/drivers');\n    const sel = document.getElementById('shifts-driver-filter');\n    drivers.filter(d => d.active).forEach(d => {\n      const opt = document.createElement('option');\n      opt.value = d.id; opt.textContent = d.name;\n      sel.appendChild(opt);\n    });\n  }\n  document.getElementById('shifts-driver-filter').addEventListener('change', loadShiftsPanel);\n  document.getElementById('shifts-date-filter').addEventListener('change', loadShiftsPanel);\n  document.getElementById('shifts-clear-filter').addEventListener('click', () => {\n    document.getElementById('shifts-driver-filter').value = '';\n    document.getElementById('shifts-date-filter').value = '';\n    loadShiftsPanel();\n  });\n  loadDriverFilterOptions().then(loadShiftsPanel);\n\n  // ---- Driver Day Report (PDF) ----\n  function localIsoDate(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; }\n  function updateDriverReportLink() {\n    const date = document.getElementById('driver-report-date').value || localIsoDate(new Date());\n    const driverId = document.getElementById('driver-report-driver').value;\n    const params = new URLSearchParams({ date });\n    if (driverId) params.set('driver_id', driverId);\n    document.getElementById('driver-report-link').href = `/api/deliveries/driver-report.pdf?${params.toString()}`;\n  }\n  document.getElementById('driver-report-date').value = localIsoDate(new Date());\n  document.getElementById('driver-report-date').addEventListener('change', updateDriverReportLink);\n  document.getElementById('driver-report-driver').addEventListener('change', updateDriverReportLink);\n  api('/api/drivers').then(drivers => {\n    const sel = document.getElementById('driver-report-driver');\n    drivers.filter(d => d.active).forEach(d => {\n      const opt = document.createElement('option');\n      opt.value = d.id; opt.textContent = d.name;\n      sel.appendChild(opt);\n    });\n    updateDriverReportLink();\n  });\n\n  document.getElementById('report-months').addEventListener('change', (e) => {\n    const months = e.target.value;\n    const href = months === '0' ? '/api/financial/report.pdf' : `/api/financial/report.pdf?months=${months}`;\n    document.getElementById('report-pdf-link').href = href;\n  });\n\n  function downloadCsv(filename, header) {\n    const blob = new Blob([header + '\\n'], { type: 'text/csv' });\n    const url = URL.createObjectURL(blob);\n    const a = document.createElement('a');\n    a.href = url; a.download = filename;\n    document.body.appendChild(a); a.click(); a.remove();\n    URL.revokeObjectURL(url);\n  }\n  document.getElementById('download-jobs-template').addEventListener('click', (e) => {\n    e.preventDefault();\n    downloadCsv('jobs-template.csv', 'customer_name,customer_phone,site_address,scope,price,target_start_date,duration_days,crew,status,permit_number,notes');\n  });\n  document.getElementById('download-sales-template').addEventListener('click', (e) => {\n    e.preventDefault();\n    downloadCsv('sales-template.csv', 'customer_name,customer_phone,material_name,quantity,unit,price_per_unit,delivery_address,delivery_fee,sales_tax_rate,order_date,driver_name,status,notes');\n  });\n  document.getElementById('download-assets-template').addEventListener('click', (e) => {\n    e.preventDefault();\n    downloadCsv('assets-template.csv', 'name,category,make,model,year,serial_vin,purchase_date,purchase_price,condition,location,estimated_value,debt_balance,debt_lender,notes');\n  });\n  document.getElementById('download-tracker-template').addEventListener('click', (e) => {\n    e.preventDefault();\n    downloadCsv('job-tracker-template.csv', 'Job Number,Job Address/Scope,Type of Job,Status,Billed,Paid,Notes');\n  });\n\n  function readFileAsText(file) {\n    return new Promise((resolve, reject) => {\n      const reader = new FileReader();\n      reader.onload = () => resolve(String(reader.result));\n      reader.onerror = reject;\n      reader.readAsText(file);\n    });\n  }\n  function readFileAsArrayBuffer(file) {\n    return new Promise((resolve, reject) => {\n      const reader = new FileReader();\n      reader.onload = () => resolve(reader.result);\n      reader.onerror = reject;\n      reader.readAsArrayBuffer(file);\n    });\n  }\n  function arrayBufferToBase64(buf) {\n    let binary = '';\n    const bytes = new Uint8Array(buf);\n    const chunkSize = 0x8000; // avoid a giant argument list to String.fromCharCode on a large file\n    for (let i = 0; i < bytes.length; i += chunkSize) {\n      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));\n    }\n    return btoa(binary);\n  }\n  // Reads a File into whichever shape the import endpoints accept: `{ csv }`\n  // for a .csv upload, or `{ xlsx_base64 }` for an .xlsx upload — an export\n  // straight from Excel or Google Sheets (File → Download → Microsoft\n  // Excel), no CSV conversion step needed. The server's rowsFromImportBody()\n  // reads either the same way.\n  async function readFileForImport(file) {\n    const isXlsx = /\\.xlsx$/i.test(file.name) || file.type === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';\n    if (isXlsx) return { xlsx_base64: arrayBufferToBase64(await readFileAsArrayBuffer(file)) };\n    return { csv: await readFileAsText(file) };\n  }\n\n  function renderResult(el, res, noun) {\n    const parts = [`<div class=\"ok-msg\">Imported ${res.imported} ${noun}.</div>`];\n    if (res.crewsCreated && res.crewsCreated.length) parts.push(`<div class=\"subtitle\">New crews created: ${res.crewsCreated.map(escapeHtml).join(', ')}</div>`);\n    if (res.customersCreated && res.customersCreated.length) parts.push(`<div class=\"subtitle\">New customers created: ${res.customersCreated.length}</div>`);\n    if (res.materialsCreated && res.materialsCreated.length) parts.push(`<div class=\"subtitle\">New materials created: ${res.materialsCreated.map(escapeHtml).join(', ')}</div>`);\n    if (res.errors && res.errors.length) {\n      parts.push(`<div class=\"error-msg\" style=\"margin-top:8px;\">${res.errors.length} row(s) had issues:</div>`);\n      parts.push(`<div class=\"error-list\">${res.errors.map(e => `<div>Row ${e.row}: ${escapeHtml(e.reason)}</div>`).join('')}</div>`);\n    }\n    el.innerHTML = parts.join('');\n  }\n\n  document.getElementById('import-jobs-btn').addEventListener('click', async () => {\n    const el = document.getElementById('jobs-import-result');\n    const file = document.getElementById('jobs-csv-file').files[0];\n    if (!file) { el.innerHTML = '<div class=\"error-msg\">Choose a CSV or Excel file first.</div>'; return; }\n    el.innerHTML = '<div class=\"subtitle\">Importing…</div>';\n    try {\n      const body = await readFileForImport(file);\n      const res = await api('/api/jobs/import', { method: 'POST', body });\n      renderResult(el, res, 'project(s)');\n    } catch (err) {\n      el.innerHTML = `<div class=\"error-msg\">${err.message}</div>`;\n    }\n  });\n\n  document.getElementById('import-sales-btn').addEventListener('click', async () => {\n    const el = document.getElementById('sales-import-result');\n    const file = document.getElementById('sales-csv-file').files[0];\n    if (!file) { el.innerHTML = '<div class=\"error-msg\">Choose a CSV or Excel file first.</div>'; return; }\n    el.innerHTML = '<div class=\"subtitle\">Importing…</div>';\n    try {\n      const body = await readFileForImport(file);\n      const res = await api('/api/orders/import', { method: 'POST', body });\n      renderResult(el, res, 'order(s)');\n    } catch (err) {\n      el.innerHTML = `<div class=\"error-msg\">${err.message}</div>`;\n    }\n  });\n\n  document.getElementById('import-assets-btn').addEventListener('click', async () => {\n    const el = document.getElementById('assets-import-result');\n    const file = document.getElementById('assets-csv-file').files[0];\n    if (!file) { el.innerHTML = '<div class=\"error-msg\">Choose a CSV or Excel file first.</div>'; return; }\n    el.innerHTML = '<div class=\"subtitle\">Importing…</div>';\n    try {\n      const body = await readFileForImport(file);\n      const res = await api('/api/assets/import', { method: 'POST', body });\n      renderResult(el, res, 'asset(s)');\n    } catch (err) {\n      el.innerHTML = `<div class=\"error-msg\">${err.message}</div>`;\n    }\n  });\n\n  document.getElementById('import-tracker-btn').addEventListener('click', async () => {\n    const el = document.getElementById('tracker-import-result');\n    const file = document.getElementById('tracker-csv-file').files[0];\n    if (!file) { el.innerHTML = '<div class=\"error-msg\">Choose a CSV or Excel file first.</div>'; return; }\n    el.innerHTML = '<div class=\"subtitle\">Importing…</div>';\n    try {\n      const body = await readFileForImport(file);\n      const res = await api('/api/jobs/tracker-import', { method: 'POST', body });\n      const parts = [`<div class=\"ok-msg\">${res.created} job(s) created, ${res.updated} updated.</div>`];\n      if (res.errors && res.errors.length) {\n        parts.push(`<div class=\"error-msg\" style=\"margin-top:8px;\">${res.errors.length} row(s) had issues:</div>`);\n        parts.push(`<div class=\"error-list\">${res.errors.map(e => `<div>Row ${e.row}: ${escapeHtml(e.reason)}</div>`).join('')}</div>`);\n      }\n      el.innerHTML = parts.join('');\n    } catch (err) {\n      el.innerHTML = `<div class=\"error-msg\">${err.message}</div>`;\n    }\n  });\n})();\n</script>\n</body>\n</html>\n"
   },
   "reset-password.html": {
     "encoding": "utf8",
