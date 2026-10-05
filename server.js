@@ -2350,13 +2350,23 @@ function recomputeOrderRollup(orderId) {
       status = 'delivered';
       const dates = active.map((d) => d.delivered_at).filter(Boolean).sort();
       if (dates.length) deliveredAt = dates[dates.length - 1];
-    } else if (active.some((d) => d.driver_id && d.scheduled_date)) {
+    } else if (active.some((d) => d.scheduled_date)) {
+      // A date alone is enough — this app's whole shared-board model
+      // (see autoAssignDelivery) deliberately schedules a load onto a date
+      // with NO driver yet, for any driver to claim later. Requiring
+      // driver_id here too used to mean an order with only unassigned-but-
+      // dated loads rolled up to 'new' instead of 'scheduled', and worse,
+      // revertDeliveryToScheduled below used the same wrong test — so
+      // undoing an out-for-delivery/delivered/refused load that had never
+      // had a specific driver dropped it all the way to 'unscheduled' and
+      // off the board, even though its date was sitting right there in the
+      // column the whole time.
       status = 'scheduled';
     } else {
       status = 'new';
     }
   }
-  const scheduledOnes = notCancelled.filter((d) => d.status !== 'refused' && d.driver_id && d.scheduled_date)
+  const scheduledOnes = notCancelled.filter((d) => d.status !== 'refused' && d.scheduled_date)
     .sort((a, b) => (a.scheduled_date === b.scheduled_date ? a.sequence - b.sequence : (a.scheduled_date < b.scheduled_date ? -1 : 1)));
   const driverId = scheduledOnes.length ? scheduledOnes[0].driver_id : null;
   const scheduledDate = scheduledOnes.length ? scheduledOnes[0].scheduled_date : null;
@@ -2366,7 +2376,14 @@ function recomputeOrderRollup(orderId) {
 function revertDeliveryToScheduled(deliveryId) {
   const d = get('SELECT * FROM deliveries WHERE id = ?', [deliveryId]);
   if (!d) return;
-  const newStatus = (d.driver_id && d.scheduled_date) ? 'scheduled' : 'unscheduled';
+  // A date is enough to count as scheduled, same reasoning as
+  // recomputeOrderRollup above — a load can sit on the shared board with a
+  // date and no driver yet. This used to also require driver_id, which
+  // meant reverting an unassigned-but-dated load (the common case for a
+  // multi-load order nobody's hand-assigned to one driver) wrongly dropped
+  // it to 'unscheduled' and off the board, even with its date untouched in
+  // the column right next to it.
+  const newStatus = d.scheduled_date ? 'scheduled' : 'unscheduled';
   const order = get('SELECT order_type FROM orders WHERE id = ?', [d.order_id]);
   if (order && order.order_type === 'trucking') {
     // Reopening a trucking job clears its punch clock and computed
