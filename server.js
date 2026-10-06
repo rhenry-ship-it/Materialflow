@@ -2098,6 +2098,24 @@ function getOrCreateInternalJobCustomer() {
   ]);
   return get('SELECT * FROM customers WHERE id = ?', [result.lastInsertRowid]);
 }
+// Placeholder customer for an order auto-created from a driver's
+// self-initiated Materials Out slip (see POST /api/driver/material-slips) —
+// unlike the internal-job customer above, we genuinely don't know yet
+// whether the load was headed to one of OPD's own sites or a paying
+// customer, so it's filed here with $0 pricing instead of guessing either
+// way. Shows up plainly in the Customer column on orders-database.html /
+// the dashboard's Needs Attention panel so the office knows to open it,
+// confirm the real customer, and set a price before it's ever invoiced.
+const REVIEW_PLACEHOLDER_CUSTOMER_NAME = 'Needs Review — Unconfirmed Customer';
+function getOrCreateReviewPlaceholderCustomer() {
+  const existing = get('SELECT * FROM customers WHERE name = ?', [REVIEW_PLACEHOLDER_CUSTOMER_NAME]);
+  if (existing) return existing;
+  const result = run('INSERT INTO customers (name, notes) VALUES (?, ?)', [
+    REVIEW_PLACEHOLDER_CUSTOMER_NAME,
+    "Auto-created placeholder — groups orders created automatically from a driver's self-initiated Materials Out slip, before the office has confirmed the real customer and price. Open each order, fix the customer and pricing, then move on.",
+  ]);
+  return get('SELECT * FROM customers WHERE id = ?', [result.lastInsertRowid]);
+}
 const TRUCKING_MATERIAL_NAME = 'For-Hire Trucking (Hourly)';
 // A for-hire trucking order still needs a material_id (orders.material_id is
 // NOT NULL and every order listing/invoice/CSV export already displays
@@ -2547,7 +2565,16 @@ on('GET', '/api/dashboard/summary', async (req, res) => {
   const invoiceCounts = get(`SELECT SUM(CASE WHEN status IN ('sent','partial') THEN total - amount_paid ELSE 0 END) as outstanding, SUM(CASE WHEN status='paid' THEN total ELSE 0 END) as paid_total FROM invoices`);
   const todaysDeliveries = all(`${DELIVERY_SELECT} WHERE del.scheduled_date = ? AND del.status != 'cancelled' ORDER BY del.driver_id, del.slot_index IS NULL, del.slot_index`, [todayStr()])
     .map((r) => ({ ...r, slot_time: slotTimeLabel(r.slot_index) }));
-  const needsAttention = all(`${ORDER_SELECT} WHERE o.status = 'new' ORDER BY o.created_at ASC LIMIT 25`).map((o) => {
+  // Alongside genuinely unscheduled ('new') orders, also surface anything
+  // still billed to the Materials-Out-slip review placeholder customer
+  // (see getOrCreateReviewPlaceholderCustomer / POST /api/driver/material-slips)
+  // regardless of status — those get auto-scheduled right away so they
+  // don't sit at 'new', but the office still needs to open each one and
+  // confirm a real customer and price before it's ever invoiced.
+  const needsAttention = all(
+    `${ORDER_SELECT} WHERE o.status = 'new' OR (o.status NOT IN ('invoiced', 'cancelled', 'paid') AND o.customer_id = (SELECT id FROM customers WHERE name = ?)) ORDER BY o.created_at ASC LIMIT 25`,
+    [REVIEW_PLACEHOLDER_CUSTOMER_NAME]
+  ).map((o) => {
     const created = parseUtcSqlDate(o.created_at);
     const hoursWaiting = created ? Math.max(0, Math.round((Date.now() - created.getTime()) / 3600000)) : null;
     return { id: o.id, order_number: o.order_number, customer_name: o.customer_name, material_name: o.material_name, quantity: o.quantity, unit: o.unit, job_number: o.job_number, created_at: o.created_at, hours_waiting: hoursWaiting };
@@ -2903,9 +2930,22 @@ on('POST', '/api/driver/job-orders', async (req, res) => {
 // heading out — separate from orders/deliveries (see db/schema.sql). A slip
 // can optionally point back at one of the driver's own scheduled stops
 // (delivery_id/order_id), set when they tap "Log Materials Out" on that
-// stop rather than starting a blank slip, but submitting one never changes
-// any order/delivery status — it's purely a log for the office to reconcile
-// against what's left the yard.
+// stop rather than starting a blank slip, and submitting one never changes
+// that existing order/delivery's status — it's purely a log for the office
+// to reconcile against what's left the yard.
+//
+// When a slip DOESN'T correlate to one of the driver's own stops — the
+// "Materials Out — New Load" standalone button, for material taken out
+// without ever being on the schedule — and the driver has
+// can_request_orders on (same permission gate as the standalone "New Job
+// Site Order" form), we also create a bare-bones order behind the scenes so
+// the office actually sees it, the same complaint that prompted this: a
+// self-initiated slip used to be invisible outside the Materials Out log.
+// We deliberately don't guess a real customer or price for it (see
+// getOrCreateReviewPlaceholderCustomer above) — it's auto-scheduled to the
+// driver for today, same as the sibling driver-initiated order endpoints
+// below, so it shows up to be reviewed/priced/corrected rather than sitting
+// nowhere.
 const MATERIAL_SLIP_SELECT = `
   SELECT s.*, dr.name as driver_name, m.name as material_name, o.order_number
   FROM material_out_slips s
@@ -2938,6 +2978,31 @@ on('POST', '/api/driver/material-slips', async (req, res) => {
       deliveryId = delivery.id;
       orderId = delivery.order_id;
     }
+  }
+
+  // Self-initiated (no existing order to attach to) — auto-create a
+  // review order for it, same as the comment block above explains. Gated
+  // behind can_request_orders so a slip from a driver the office hasn't
+  // approved to create orders stays a pure log, exactly like before.
+  let createdOrder = null;
+  if (!orderId && driver.can_request_orders) {
+    const reviewCustomer = getOrCreateReviewPlaceholderCustomer();
+    const orderNumber = nextOrderNumber();
+    const notesText = `Auto-created from a Materials Out slip logged by ${driver.name} — needs customer & pricing review.${b.notes ? ` Driver's note: ${b.notes}` : ''}`;
+    const orderResult = run(
+      `INSERT INTO orders (order_number, customer_id, material_id, quantity, unit, price_per_unit, delivery_address, delivery_fee, sales_tax_rate, sales_tax_enabled, sales_tax_amount, total_amount, requested_date, requested_window, notes, requested_by_driver_id, status) VALUES (?, ?, ?, ?, ?, 0, ?, 0, 0, 0, 0, 0, ?, 'ASAP', ?, ?, 'new')`,
+      [orderNumber, reviewCustomer.id, material.id, quantity, material.unit, destination, todayStr(), notesText, driver.id]
+    );
+    orderId = orderResult.lastInsertRowid;
+    const scheduling = generateDeliveriesForOrder({ id: orderId, quantity, total_amount: 0 }, { startDate: todayStr(), preferredDriverId: driver.id });
+    recomputeOrderRollup(orderId);
+    createdOrder = get(`${ORDER_SELECT} WHERE o.id = ?`, [orderId]);
+    if (scheduling.warning) createdOrder.schedule_warning = scheduling.warning;
+    notifyNewOrder(createdOrder);
+    recordAudit(req, {
+      role: 'driver', name: driver.name, driverId: driver.id, action: 'auto_order_from_slip', method: 'POST', path: '/api/driver/material-slips', status: 201,
+      detail: `Materials Out slip auto-created order ${orderNumber} (needs customer/pricing review) — ${quantity} ${material.unit} ${material.name} to ${destination}`,
+    });
   }
 
   // Optional photo of the paper slip the supplier handed the driver — same
