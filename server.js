@@ -473,6 +473,23 @@ function setSetting(key, value) {
 })();
 
 // ---------------------------------------------------------------------------
+// One-time data additions — each runs on every boot but only inserts the
+// first time (checked by name), so it's safe alongside the empty-DB-only
+// seed() above, which never touches an already-seeded production database.
+// ---------------------------------------------------------------------------
+(function seedBillyAndTrucks() {
+  if (!get('SELECT id FROM drivers WHERE name = ?', ['Billy Cinquerano'])) {
+    run('INSERT INTO drivers (name, pin) VALUES (?, ?)', ['Billy Cinquerano', '0000']);
+  }
+  const trucks = ['International 6 Wheel Dump', '2025 Kenworth T880'];
+  trucks.forEach((name) => {
+    if (!get('SELECT id FROM assets WHERE name = ?', [name])) {
+      run(`INSERT INTO assets (name, category, condition) VALUES (?, 'truck', 'good')`, [name]);
+    }
+  });
+})();
+
+// ---------------------------------------------------------------------------
 // Delivery distance estimator (Nominatim geocoding + OSRM driving distance,
 // both free/no-key public services; falls back to a padded straight-line
 // estimate if the routing service is unreachable)
