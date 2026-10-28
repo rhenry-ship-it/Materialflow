@@ -488,6 +488,11 @@ function setSetting(key, value) {
     }
   });
 })();
+(function seedGeraldParrillo() {
+  if (!get('SELECT id FROM drivers WHERE name = ?', ['Gerald Parrillo'])) {
+    run('INSERT INTO drivers (name, pin) VALUES (?, ?)', ['Gerald Parrillo', '0000']);
+  }
+})();
 
 // ---------------------------------------------------------------------------
 // Delivery distance estimator (Nominatim geocoding + OSRM driving distance,
